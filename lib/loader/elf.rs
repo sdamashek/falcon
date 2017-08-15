@@ -133,6 +133,7 @@ impl ElfLinker {
         let ref elf = self.loaded[&filename];
         let dynsyms = elf.elf().dynsyms;
         let dynstrtab = elf.elf().dynstrtab;
+        let header = elf.elf().header;
         for reloc in elf.elf()
                         .dynrelas
                         .iter()
@@ -142,77 +143,100 @@ impl ElfLinker {
                                   .chain(elf.elf()
                                             .pltrelocs
                                             .iter())) {
-            match reloc.r_type {
-                goblin::elf::reloc::R_386_32 => {
-                    let ref sym = dynsyms[reloc.r_sym];
-                    let sym_name = dynstrtab.get(sym.st_name);
-                    let value = match self.symbols.get(sym_name) {
-                        Some(v) => v.to_owned() as u32,
-                        None => bail!("Could not resolve symbol {}", sym_name)
-                    };
-                    self.memory.set_u32_le(
-                        reloc.r_offset as u64 + elf.base_address(),
-                        value
-                    )?;
-                }
-                goblin::elf::reloc::R_386_GOT32 => {
-                    bail!("R_386_GOT32");
+            match header.e_machine {
+                goblin::elf::header::EM_386 => {
+                    match reloc.r_type {
+                        goblin::elf::reloc::R_386_NONE => {},
+                        goblin::elf::reloc::R_386_32 => {
+                            let value = match self.resolve_reloc_symbol(&filename, &reloc) {
+                                Ok(v) => v.to_owned() as u32,
+                                Err(e) => {
+                                    warn!("{}", e);
+                                    continue
+                                }
+                            };
+                            self.memory.set_u32_le(
+                                reloc.r_offset as u64 + elf.base_address(),
+                                value
+                            )?;
+                        },
+                        goblin::elf::reloc::R_386_PC32 => {
+                            let value = match self.resolve_reloc_symbol(&filename, &reloc) {
+                                Ok(v) => v.to_owned() as u32,
+                                Err(e) => {
+                                    warn!("{}", e);
+                                    continue
+                                }
+                            };
+                            self.memory.set_u32_le(
+                                reloc.r_offset as u64 + elf.base_address(),
+                                value - (reloc.r_offset as u32)
+                            )?;
+                        },
+                        goblin::elf::reloc::R_386_GOT32 => {
+                            bail!("R_386_GOT32");
+                        },
+                        goblin::elf::reloc::R_386_PLT32 => {
+                            let ref sym = dynsyms[reloc.r_sym];
+                            let sym_name = dynstrtab.get(sym.st_name);
+                            bail!("R_386_PLT32 {}:0x{:x}:{}", filename, reloc.r_offset, sym_name);
+                        },
+                        goblin::elf::reloc::R_386_COPY => {
+                            let address = match self.resolve_reloc_symbol(&filename, &reloc) {
+                                Ok(v) => v.to_owned() as u64,
+                                Err(e) => {
+                                    warn!("{}", e);
+                                    continue
+                                }
+                            };
+
+                            if let Some(value) = self.memory.get_u32_le(address) {
+                                self.memory.set_u32_le(
+                                    reloc.r_offset as u64 + elf.base_address(),
+                                    value
+                                )?;
+                            } else {
+                                warn!("Could not read address 0x{:x} in R_386_COPY", address);
+                                continue
+                            }
+                        },
+                        goblin::elf::reloc::R_386_GLOB_DAT
+                            | goblin::elf::reloc::R_386_JMP_SLOT => {
+                            let value = match self.resolve_reloc_symbol(&filename, &reloc) {
+                                Ok(v) => v.to_owned() as u32,
+                                Err(e) => {
+                                    warn!("{}", e);
+                                    continue
+                                }
+                            };
+                            self.memory.set_u32_le(
+                                reloc.r_offset as u64 + elf.base_address(),
+                                value
+                            )?;
+                        },
+                        goblin::elf::reloc::R_386_RELATIVE => {
+                            let value = self.memory.get_u32_le(reloc.r_offset as u64 + elf.base_address());
+                            let value = match value {
+                                Some(value) => elf.base_address() as u32 + value,
+                                None => bail!("Invalid address for R_386_RELATIVE {}:{:x}",
+                                              filename,
+                                              reloc.r_offset)
+                            };
+                            self.memory.set_u32_le(reloc.r_offset as u64 + elf.base_address(), value)?;
+                        },
+                        goblin::elf::reloc::R_386_GOTPC => {
+                            bail!("R_386_GOT_PC");
+                        },
+                        goblin::elf::reloc::R_386_TLS_TPOFF => {
+                            warn!("Ignoring R_386_TLS_TPOFF Relocation");
+                        },
+                        goblin::elf::reloc::R_386_IRELATIVE => {
+                            warn!("R_386_IRELATIVE {}:0x{:x} going unprocessed", filename, reloc.r_offset);
+                        },
+                        _ => bail!("unhandled relocation type {}", reloc.r_type)
+                    }
                 },
-                goblin::elf::reloc::R_386_PLT32 => {
-                    let ref sym = dynsyms[reloc.r_sym];
-                    let sym_name = dynstrtab.get(sym.st_name);
-                    bail!("R_386_PLT32 {}:0x{:x}:{}", filename, reloc.r_offset, sym_name);
-                },
-                goblin::elf::reloc::R_386_COPY => {
-                    bail!("R_386_COPY");
-                },
-                goblin::elf::reloc::R_386_GLOB_DAT => {
-                    let ref sym = dynsyms[reloc.r_sym];
-                    let sym_name = dynstrtab.get(sym.st_name);
-                    let value = match self.symbols.get(sym_name) {
-                        Some(v) => v.to_owned() as u32,
-                        None => {
-                            warn!("Could not resolve symbol {}", sym_name);
-                            continue
-                        }
-                    };
-                    self.memory.set_u32_le(
-                        reloc.r_offset as u64 + elf.base_address(),
-                        value
-                    )?;
-                },
-                goblin::elf::reloc::R_386_JMP_SLOT => {
-                    let ref sym = dynsyms[reloc.r_sym];
-                    let sym_name = dynstrtab.get(sym.st_name);
-                    let value = match self.symbols.get(sym_name) {
-                        Some(v) => v.to_owned() as u32,
-                        None => bail!("Could not resolve symbol {}", sym_name)
-                    };
-                    self.memory.set_u32_le(
-                        reloc.r_offset as u64 + elf.base_address(),
-                        value
-                    )?;
-                },
-                goblin::elf::reloc::R_386_RELATIVE => {
-                    let value = self.memory.get_u32_le(reloc.r_offset as u64 + elf.base_address());
-                    let value = match value {
-                        Some(value) => elf.base_address() as u32 + value,
-                        None => bail!("Invalid address for R_386_RELATIVE {}:{:x}",
-                                      filename,
-                                      reloc.r_offset)
-                    };
-                    self.memory.set_u32_le(reloc.r_offset as u64 + elf.base_address(), value)?;
-                },
-                goblin::elf::reloc::R_386_GOTPC => {
-                    bail!("R_386_GOT_PC");
-                },
-                goblin::elf::reloc::R_386_TLS_TPOFF => {
-                    warn!("Ignoring R_386_TLS_TPOFF Relocation");
-                },
-                goblin::elf::reloc::R_386_IRELATIVE => {
-                    warn!("R_386_IRELATIVE {}:0x{:x} going unprocessed", filename, reloc.r_offset);
-                }
-                _ => bail!("unhandled relocation type {}", reloc.r_type)
+                _ => bail!("unhandled ELF machine {}", header.e_machine)
             }
         }
 
@@ -225,6 +249,20 @@ impl ElfLinker {
     /// lifted when calling `to_program`.
     pub fn add_user_function(&mut self, address: u64) {
         self.user_functions.push(address);
+    }
+
+    fn resolve_reloc_symbol(&self, filename: &str, reloc: &goblin::elf::reloc::Reloc) -> Result<u64> {
+        let ref elf = self.loaded[filename];
+        let dynsyms = elf.elf().dynsyms;
+        let dynstrtab = elf.elf().dynstrtab;
+
+        let ref sym = dynsyms[reloc.r_sym];
+        let sym_name = dynstrtab.get(sym.st_name);
+        
+        match self.symbols.get(sym_name) {
+            Some(address) => Ok(*address),
+            None => Err(format!("Could not resolve symbol {}", sym_name).into())
+        }
     }
 }
 
